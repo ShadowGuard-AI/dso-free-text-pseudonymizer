@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-free-text-pseudonymizer
 Replaces instances of free-form text (e.g., in a 'comments' field) with pseudonyms generated using a consistent hashing algorithm and a seeded random number generator, so that the same input text always maps to the same pseudonym but revealing no source information. Utilizes `hashlib` and `faker`. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats
 
