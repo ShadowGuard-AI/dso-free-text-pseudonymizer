@@ -136,10 +136,11 @@ def main():
     if supplied_key:
         run_key = supplied_key.encode('utf-8')
     else:
-        # Fresh random key for this run only. It is never stored or
-        # logged, so nobody can check a guessed line against this
-        # run's pseudonyms afterwards.
+        # Fresh random key for this run only. It is never stored, so
+        # nobody can check a guessed line against this run's
+        # pseudonyms afterwards.
         run_key = secrets.token_bytes(32)
+        logging.info("No key supplied: this run uses a fresh random run key that is never stored, so this run's mapping cannot be verified or reproduced afterwards.")
 
     process_file(args.input_file, args.output_file, args.seed, args.locale, run_key)
 
