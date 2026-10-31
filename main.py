@@ -2,8 +2,12 @@
 
 import argparse
 import hashlib
+import hmac
 import logging
+import os
+import secrets
 import sys
+from pathlib import Path
 
 from faker import Faker
 import chardet
@@ -15,72 +19,72 @@ def setup_argparse():
     """
     Sets up the argument parser for the CLI.
     """
-    parser = argparse.ArgumentParser(description="Pseudonymize free-form text using consistent hashing and a seeded random number generator.")
+    parser = argparse.ArgumentParser(description="Pseudonymize free-form text using a keyed hash and a seeded random number generator.")
     parser.add_argument("input_file", help="Path to the input text file.")
     parser.add_argument("output_file", help="Path to the output file with pseudonymized text.")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the random number generator (default: 42).  Using the same seed will produce consistent pseudonyms.")
     parser.add_argument("--locale", type=str, default="en_US", help="Locale for generating fake data (default: en_US).  See faker documentation for available locales.")
+    parser.add_argument("--key", type=str, default=None, help="Operator secret that keys the pseudonym mapping. The DSO_PSEUDONYMIZER_KEY environment variable can supply it instead. If neither is given, a fresh random key is generated for the run and never stored, so that run's mapping cannot be reproduced or checked later.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     
     return parser
 
-def pseudonymize_text(text, seed, locale="en_US"):
+def pseudonymize_text(text, seed, locale="en_US", run_key=None):
     """
-    Pseudonymizes the given text using a consistent hashing algorithm and Faker.
+    Pseudonymizes the given text using a keyed hash and Faker.
+
+    The mapping is an HMAC of the text under the run key, combined
+    with the caller supplied seed. Only a holder of the run key can
+    check a guessed line against its pseudonym. A generation error
+    raises instead of returning the original text.
 
     Args:
         text (str): The text to pseudonymize.
         seed (int): The seed for the random number generator.
         locale (str): The locale for Faker to use.
+        run_key (bytes): The key for the mapping for this run.
 
     Returns:
         str: The pseudonymized text.
     """
-    try:
-        # Create a hash of the input text to ensure consistency.
-        hashed_text = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    if run_key is None:
+        run_key = secrets.token_bytes(32)
+    message = f"{seed}\x00{text}".encode('utf-8')
+    digest = hmac.new(run_key, message, hashlib.sha256).digest()
+    Faker.seed(int.from_bytes(digest, 'big') % (2**32))
+    fake = Faker(locale)
+    return fake.sentence()
 
-        # Seed the random number generator using the hash. This makes the pseudonym generation consistent.
-        Faker.seed(int(hashed_text, 16) % (2**32))  # Ensure seed is within a reasonable range
-        fake = Faker(locale)
-
-        # Generate a pseudonym using Faker.  Consider using more context-aware methods if needed
-        # (e.g., if the input is a name, use fake.name(), if it's an address, use fake.address()).
-        pseudonym = fake.sentence()  # Use a sentence by default
-        return pseudonym
-
-    except Exception as e:
-        logging.error(f"Error pseudonymizing text: {e}")
-        return text  # Return the original text in case of error.  This is important to avoid data loss.
-
-def process_file(input_file, output_file, seed, locale):
+def process_file(input_file, output_file, seed, locale, run_key=None):
     """
     Processes the input file, pseudonymizes each line, and writes the output to the output file.
+
+    The output path is checked against the resolved input path
+    before any file is opened. The input is read in full, and every
+    pseudonym is generated, before the output file is opened. A
+    generation error therefore writes no output at all.
 
     Args:
         input_file (str): The path to the input file.
         output_file (str): The path to the output file.
         seed (int): The seed for the random number generator.
         locale (str): The locale for Faker.
+        run_key (bytes): The key for the mapping for this run.
     """
+    if Path(input_file).resolve() == Path(output_file).resolve():
+        logging.error("Output file must not be the input file; refusing to run.")
+        sys.exit(1)
+    if run_key is None:
+        run_key = secrets.token_bytes(32)
     try:
-        # Detect the file encoding
         with open(input_file, 'rb') as f:
             raw_data = f.read()
-            result = chardet.detect(raw_data)
-            encoding = result['encoding']
-
+        result = chardet.detect(raw_data)
+        encoding = result['encoding']
         if encoding is None:
-            encoding = 'utf-8' # Fallback if chardet fails
+            encoding = 'utf-8'
             logging.warning("Could not automatically detect file encoding.  Falling back to utf-8.")
-
-
-        with open(input_file, 'r', encoding=encoding) as infile, open(output_file, 'w', encoding='utf-8') as outfile:
-            for line in infile:
-                line = line.rstrip('\n') #Remove trailing newlines
-                pseudonymized_line = pseudonymize_text(line, seed, locale)
-                outfile.write(pseudonymized_line + '\n')  # Add newline character to maintain line structure.
-
+        text = raw_data.decode(encoding)
     except FileNotFoundError:
         logging.error(f"Input file not found: {input_file}")
         sys.exit(1)
@@ -89,6 +93,27 @@ def process_file(input_file, output_file, seed, locale):
         sys.exit(1)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
+
+    if text == "":
+        logging.error("No text processed: the input file is empty.")
+        sys.exit(1)
+
+    lines = text.splitlines()
+    try:
+        pseudonymized_lines = [
+            pseudonymize_text(line, seed, locale, run_key) for line in lines
+        ]
+    except Exception as e:
+        logging.error(f"Error pseudonymizing text: {e}")
+        sys.exit(1)
+
+    try:
+        with open(output_file, 'w', encoding='utf-8') as outfile:
+            for pseudonymized_line in pseudonymized_lines:
+                outfile.write(pseudonymized_line + '\n')
+    except IOError as e:
+        logging.error(f"IOError: {e}")
         sys.exit(1)
 
 def main():
@@ -107,7 +132,16 @@ def main():
     logging.info(f"Seed: {args.seed}")
     logging.info(f"Locale: {args.locale}")
 
-    process_file(args.input_file, args.output_file, args.seed, args.locale)
+    supplied_key = args.key or os.environ.get("DSO_PSEUDONYMIZER_KEY")
+    if supplied_key:
+        run_key = supplied_key.encode('utf-8')
+    else:
+        # Fresh random key for this run only. It is never stored or
+        # logged, so nobody can check a guessed line against this
+        # run's pseudonyms afterwards.
+        run_key = secrets.token_bytes(32)
+
+    process_file(args.input_file, args.output_file, args.seed, args.locale, run_key)
 
     logging.info("File processing complete.")
 
@@ -127,6 +161,9 @@ if __name__ == "__main__":
 #
 # 4. Enabling debug logging:
 #    python dso_free_text_pseudonymizer.py input.txt output.txt --debug
+#
+# 5. Supplying an operator key for the mapping:
+#    python dso_free_text_pseudonymizer.py input.txt output.txt --key OPERATOR_SECRET
 #
 # Example offensive tool usage (demonstrating limitations and potential misuse):
 # Suppose 'input.txt' contains sensitive data like social security numbers or credit card numbers.
