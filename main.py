@@ -51,6 +51,13 @@ def pseudonymize_text(text, seed, locale="en_US", run_key=None):
         run_key = secrets.token_bytes(32)
     message = f"{seed}\x00{text}".encode('utf-8')
     digest = hmac.new(run_key, message, hashlib.sha256).digest()
+    # The 256 bit digest is cut down to a 32 bit Faker seed, because that
+    # is what Faker.seed takes here. The keyed hash still decides which of
+    # those seeds a line lands on, but the space of distinct pseudonym
+    # sentences is the 32 bit space, not the digest space. Faker.seed is
+    # also class level state: seeding it per line means this call leaves
+    # the Faker generator seeded for whatever runs after it in the same
+    # process.
     Faker.seed(int.from_bytes(digest, 'big') % (2**32))
     fake = Faker(locale)
     return fake.sentence()
@@ -99,6 +106,14 @@ def process_file(input_file, output_file, seed, locale, run_key=None):
         logging.error("No text processed: the input file is empty.")
         sys.exit(1)
 
+    # The unit of replacement is the whole line, whatever it holds: a
+    # three character line and a five hundred character line each become
+    # one fake sentence, so line count is the only structure the output
+    # preserves. Two consequences follow. An empty line is pseudonymized
+    # like any other, so a blank line in the input becomes a full sentence
+    # in the output, content appearing where there was none; and a line
+    # repeated anywhere in the file, or in another file under the same key
+    # and seed, gets the same sentence every time.
     lines = text.splitlines()
     try:
         pseudonymized_lines = [
@@ -109,6 +124,9 @@ def process_file(input_file, output_file, seed, locale, run_key=None):
         sys.exit(1)
 
     try:
+        # Every output line is terminated, including the last, so an input
+        # that ended without a newline gains one; splitlines also consumed
+        # the original line endings, so CRLF input comes out LF.
         with open(output_file, 'w', encoding='utf-8') as outfile:
             for pseudonymized_line in pseudonymized_lines:
                 outfile.write(pseudonymized_line + '\n')
